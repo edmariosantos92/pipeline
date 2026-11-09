@@ -1,0 +1,20 @@
+[project]
+name = "simulador-cartoes"
+version = "1.1.0"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# E/F/W: erros e estilo | I: imports | B: bugs prováveis | UP: Python moderno
+# S: segurança (flake8-bandit) | SIM: simplificações | RUF: regras do Ruff
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106"]  # assert e senhas fictícias são esperados em testes
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,35 +1,42 @@
-"""
-Módulo de autenticação do Simulador de Cartões de Crédito.
+"""Autenticação do Simulador de Cartões de Crédito.
 
-Contém vulnerabilidades intencionais: hash criptográfico fraco (MD5)
-para senhas e geração de token de sessão com gerador de números
-pseudoaleatórios não criptográfico (random, em vez de secrets).
+Senhas são verificadas com hash adaptativo (scrypt, via Werkzeug) e
+tokens de sessão vêm de um gerador criptograficamente seguro.
 """
 
-import hashlib
-import random
-import string
+import secrets
 
-# Base de usuários simplificada para fins do laboratório.
-# A senha abaixo corresponde ao hash MD5 de "password".
-USUARIOS = {
-    "admin": "5f4dcc3b5aa765d61d8327deb882cf99",
-}
+from werkzeug.security import check_password_hash, generate_password_hash
 
+import config
 
-def gerar_hash_senha(senha):
-    """Gera o hash da senha usando MD5 — algoritmo criptograficamente fraco."""
-    return hashlib.md5(senha.encode()).hexdigest()
+USUARIO_ADMIN = "admin"
+
+# Hash de uma senha aleatória, usado quando o usuário não existe: a
+# verificação custa o mesmo tempo e não revela quais usuários existem.
+_HASH_FICTICIO = generate_password_hash(secrets.token_urlsafe(32))
 
 
-def validar_login(usuario, senha):
-    """Valida as credenciais informadas contra a base de usuários."""
-    hash_informado = gerar_hash_senha(senha)
-    return USUARIOS.get(usuario) == hash_informado
+def gerar_hash_senha(senha: str) -> str:
+    """Gera o hash da senha com scrypt e salt aleatório."""
+    return generate_password_hash(senha)
 
 
-def gerar_token_sessao():
-    """Gera um token de sessão usando o módulo random — previsível,
-    não deve ser usado para fins de segurança."""
-    caracteres = string.ascii_letters + string.digits
-    return "".join(random.choice(caracteres) for _ in range(32))
+def validar_login(usuario: str | None, senha: str | None) -> bool:
+    """Valida as credenciais em tempo constante em relação ao usuário."""
+    if not usuario or not senha:
+        return False
+    hash_armazenado = _hash_do_usuario(usuario)
+    senha_confere = check_password_hash(hash_armazenado or _HASH_FICTICIO, senha)
+    return hash_armazenado is not None and senha_confere
+
+
+def gerar_token_sessao() -> str:
+    """Gera um token de sessão imprevisível (256 bits de entropia)."""
+    return secrets.token_urlsafe(32)
+
+
+def _hash_do_usuario(usuario: str) -> str | None:
+    if usuario == USUARIO_ADMIN and config.ADMIN_PASSWORD_HASH:
+        return config.ADMIN_PASSWORD_HASH
+    return None
