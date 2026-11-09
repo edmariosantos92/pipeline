@@ -1,0 +1,108 @@
+# =============================================================
+# 07-deployment-hardened.yaml
+# Deployment corrigido do Simulador de Cartões de Crédito, que fecha
+# as vulnerabilidades 3 a 8 de 01-vulneravel.yaml:
+#   3/4/5. Sem privileged, sem root e sem privilege escalation; todas as
+#          capabilities removidas, seccomp RuntimeDefault e sistema de
+#          arquivos raiz somente leitura (atende Pod Security "restricted");
+#   6.     Imagem referenciada por digest — a esteira injeta repositório@digest
+#          com o digest exato que passou pelos scans e foi assinado;
+#   7.     requests/limits de CPU e memória definidos;
+#   8.     liveness e readiness probes em /saude.
+# Segredos vêm do Secret "simulador-cartoes-secret", criado pela esteira
+# a partir dos GitHub Secrets do Environment "producao".
+# =============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: simulador-cartoes-sa
+  namespace: cartoes
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simulador-cartoes
+  namespace: cartoes
+  labels:
+    app: simulador-cartoes
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: simulador-cartoes
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: simulador-cartoes
+    spec:
+      serviceAccountName: simulador-cartoes-sa
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: simulador-cartoes
+          image: ${IMAGEM_REPOSITORIO}@${IMAGEM_DIGEST}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5000
+          envFrom:
+            - secretRef:
+                name: simulador-cartoes-secret
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /saude
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /saude
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: simulador-cartoes
+  namespace: cartoes
+spec:
+  selector:
+    app: simulador-cartoes
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
