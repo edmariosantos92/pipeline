@@ -1,11 +1,15 @@
 # Atualizações automáticas de dependências. Cada PR passa pela esteira
 # completa antes do merge, então nenhuma atualização entra sem ser escaneada.
+# O cooldown espera 7 dias após cada release: versões maliciosas publicadas em
+# ataques de supply chain costumam ser detectadas e retiradas nesse intervalo.
 version: 2
 updates:
   - package-ecosystem: pip
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       python:
         patterns: ["*"]
@@ -14,11 +18,15 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     groups:
       actions:
         patterns: ["*"]
