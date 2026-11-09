@@ -1,0 +1,48 @@
+name: Portão de segurança
+description: >
+  Publica um relatório SARIF (artefato do job e aba Security do GitHub)
+  e aplica a política de bloqueio da esteira com scripts/ci/security_gate.py.
+
+inputs:
+  nome:
+    description: Nome da estação, exibido no resumo do job.
+    required: true
+  relatorio:
+    description: Caminho do arquivo SARIF.
+    required: true
+  categoria:
+    description: Identificador único do relatório (nome do artefato e categoria no Code Scanning).
+    required: true
+  bloquear-em:
+    description: Níveis SARIF que bloqueiam o build (error, warning, note, none), separados por vírgula.
+    default: error
+
+runs:
+  using: composite
+  steps:
+    - name: Publicar relatório como artefato
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: relatorio-${{ inputs.categoria }}
+        path: ${{ inputs.relatorio }}
+        if-no-files-found: warn
+        retention-days: 30
+
+    # A aba Security exige repositório público ou GitHub Advanced Security.
+    # Por isso o envio não decide nada: quem aprova ou bloqueia é o portão abaixo.
+    - name: Enviar ao GitHub Code Scanning
+      if: always() && hashFiles(inputs.relatorio) != ''
+      continue-on-error: true
+      uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+      with:
+        sarif_file: ${{ inputs.relatorio }}
+        category: ${{ inputs.categoria }}
+
+    - name: Aplicar política do portão
+      shell: bash
+      env:
+        NOME: ${{ inputs.nome }}
+        NIVEIS: ${{ inputs.bloquear-em }}
+        RELATORIO: ${{ inputs.relatorio }}
+      run: python3 "$GITHUB_WORKSPACE/scripts/ci/security_gate.py" --nome "$NOME" --bloquear-em "$NIVEIS" "$RELATORIO"

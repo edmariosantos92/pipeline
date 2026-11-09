@@ -1,3 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Relatórios gerados pelos scanners (publicados como artefatos na esteira)
+relatorios/
+.zap/relatorios/
+*.sarif
 leaks.json
-.gitignore
 semgrep-results.json
+
+# Build local
+image.tar
+cartoes.db

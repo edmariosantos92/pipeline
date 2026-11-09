@@ -1,0 +1,101 @@
+name: Scan Agendado - Vigilância Contínua
+
+# O risco muda sem que o código mude: uma CVE nova pode afetar uma
+# dependência ou a imagem que já está em produção. Este workflow repete
+# as varreduras todos os dias, independentemente de commits.
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 03:00 em Brasília
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RELATORIOS: relatorios
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+
+jobs:
+  segredos:
+    name: Revarredura de Segredos (Gitleaks)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Varrer o histórico do Git
+        run: |
+          mkdir -p "$RELATORIOS"
+          docker run --rm --network none \
+            -v "$PWD:/repo" \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            "$GITLEAKS_IMAGE" git /repo \
+              --config /repo/.gitleaks.toml \
+              --gitleaks-ignore-path /repo/.gitleaksignore \
+              --redact --exit-code 0 \
+              --report-format sarif --report-path "/repo/$RELATORIOS/gitleaks.sarif"
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: Segredos (agendado)
+          relatorio: ${{ env.RELATORIOS }}/gitleaks.sarif
+          categoria: gitleaks-agendado
+          bloquear-em: error,warning,note
+
+  dependencias:
+    name: Revarredura de Dependências (Trivy)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Procurar CVEs novas nas dependências
+        run: |
+          mkdir -p "$RELATORIOS"
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" \
+            fs --scanners vuln --ignore-unfixed --format sarif --output "$RELATORIOS/trivy-sca.sarif" .
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: SCA (agendado)
+          relatorio: ${{ env.RELATORIOS }}/trivy-sca.sarif
+          categoria: trivy-sca-agendado
+
+  imagem-producao:
+    name: Revarredura da Imagem em Produção (Trivy)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Procurar CVEs novas na imagem publicada
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$RELATORIOS"
+          imagem="ghcr.io/${GITHUB_REPOSITORY,,}:producao"
+          docker run --rm -e TRIVY_USERNAME -e TRIVY_PASSWORD -v "$PWD/$RELATORIOS:/out" "$TRIVY_IMAGE" \
+            image --ignore-unfixed --format sarif --output /out/trivy-imagem.sarif "$imagem"
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: Imagem em produção (agendado)
+          relatorio: ${{ env.RELATORIOS }}/trivy-imagem.sarif
+          categoria: trivy-imagem-agendado

@@ -1,0 +1,72 @@
+# Plano do OWASP ZAP (Automation Framework) usado na Estação 7 — DAST.
+#
+# O spider não descobre rotas de uma API JSON sem links, então o job
+# "requestor" alimenta o ZAP com cada endpoint e parâmetro reais. Em
+# seguida o scan ativo dispara ataques (SQLi, Command Injection, Path
+# Traversal, SSRF, Code Injection...) contra esses parâmetros.
+#
+# Política de portão: a esteira bloqueia em qualquer alerta de risco ALTO
+# (nível "error" no SARIF). Médio e baixo aparecem no relatório.
+env:
+  contexts:
+    - name: simulador-cartoes
+      urls:
+        - ${TARGET_URL}
+      includePaths:
+        - ${TARGET_URL}.*
+  parameters:
+    failOnError: true
+    failOnWarning: false
+    progressToStdout: true
+
+jobs:
+  - type: requestor
+    parameters:
+      user: ""
+    requests:
+      - url: ${TARGET_URL}/saude
+      - url: ${TARGET_URL}/fatura?numero_cartao=4111111111111111
+      - url: ${TARGET_URL}/cartoes?cpf=12345678901
+      - url: ${TARGET_URL}/relatorio?formato=pdf
+      - url: ${TARGET_URL}/extrato?arquivo=janeiro.txt
+      - url: ${TARGET_URL}/diagnostico?verificacao=horario-utc
+      - url: ${TARGET_URL}/preferencias?dados=%7B%22email%22%3Atrue%7D
+      - url: ${TARGET_URL}/simular-limite?expressao=5000*1.2
+      - url: ${TARGET_URL}/login
+        method: POST
+        headers:
+          - "Content-Type: application/x-www-form-urlencoded"
+        data: usuario=admin&senha=teste
+      - url: ${TARGET_URL}/webhook
+        method: POST
+        headers:
+          - "Content-Type: application/x-www-form-urlencoded"
+        data: url=https%3A%2F%2Fhooks.exemplo.com.br%2Fnotificar&payload=%7B%7D
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 2
+
+  - type: activeScan
+    parameters:
+      context: simulador-cartoes
+      maxRuleDurationInMins: 2
+      maxScanDurationInMins: 10
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 2
+
+  - type: report
+    parameters:
+      template: sarif-json
+      reportDir: /zap/wrk/relatorios
+      reportFile: zap.sarif.json
+    risks: [high, medium, low, info]
+
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: /zap/wrk/relatorios
+      reportFile: zap.html
+      reportTitle: DAST - Simulador de Cartoes de Credito

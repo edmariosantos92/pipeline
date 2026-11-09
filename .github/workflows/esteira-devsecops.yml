@@ -1,0 +1,429 @@
+name: Esteira DevSecOps
+
+# 8 estações em sequência; cada uma só roda se a anterior passou.
+#   1 Segredos → 2 SAST → 3 Build → 4 SCA/IaC → 5 Package
+#   → 6 Scan da imagem → 7 Homologação + DAST → 8 Aprovação + Produção
+#
+# A imagem é construída UMA vez (estação 5) e o mesmo artefato percorre
+# as estações 6, 7 e 8: o que vai para produção é exatamente o que foi
+# escaneado e testado. Nada é publicado no registry antes da aprovação.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Menor privilégio: nada além de leitura por padrão; cada job pede o que precisa.
+permissions:
+  contents: read
+
+env:
+  RELATORIOS: relatorios
+  IMAGEM_LOCAL: simulador-cartoes:${{ github.sha }}
+  # Ferramentas fixadas por versão + digest (imutáveis).
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+  SEMGREP_IMAGE: semgrep/semgrep:1.184.0@sha256:cc1b68266f267878b39739373ea9985b9a78e5d64497dd875c8de100b22695ed
+  TRIVY_IMAGE: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+  HADOLINT_IMAGE: hadolint/hadolint:v2.15.1@sha256:32dac94127fd60b7b7e3fbfc65e1383b9b5e25c9bfd7b8536de7a539fe68a12d
+  ZAP_IMAGE: zaproxy/zap-stable:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+
+jobs:
+  # ===========================================================================
+  # ESTAÇÃO 1 — Detecção de segredos (Gitleaks)
+  # Varre o HISTÓRICO COMPLETO. Qualquer segredo novo bloqueia; os achados
+  # históricos já tratados estão no baseline .gitleaksignore.
+  # ===========================================================================
+  segredos:
+    name: "1 - Segredos (Gitleaks)"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Varrer o histórico do Git
+        run: |
+          mkdir -p "$RELATORIOS"
+          docker run --rm --network none \
+            -v "$PWD:/repo" \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            "$GITLEAKS_IMAGE" git /repo \
+              --config /repo/.gitleaks.toml \
+              --gitleaks-ignore-path /repo/.gitleaksignore \
+              --redact --exit-code 0 \
+              --report-format sarif --report-path "/repo/$RELATORIOS/gitleaks.sarif"
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: "1 - Segredos (Gitleaks)"
+          relatorio: ${{ env.RELATORIOS }}/gitleaks.sarif
+          categoria: gitleaks
+          bloquear-em: error,warning,note # segredo não tem severidade aceitável
+
+  # ===========================================================================
+  # ESTAÇÃO 2 — SAST (Semgrep)
+  # OWASP Top 10 + regras Python/Flask + regras customizadas do banco.
+  # ===========================================================================
+  sast:
+    name: "2 - SAST (Semgrep)"
+    needs: segredos
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Analisar o código-fonte
+        run: |
+          mkdir -p "$RELATORIOS"
+          docker run --rm \
+            -v "$PWD:/src" -w /src \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            "$SEMGREP_IMAGE" semgrep scan \
+              --config p/owasp-top-ten \
+              --config p/python \
+              --config p/flask \
+              --config p/secrets \
+              --config regras-banco \
+              --metrics=off \
+              --sarif --output "$RELATORIOS/semgrep.sarif"
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: "2 - SAST (Semgrep)"
+          relatorio: ${{ env.RELATORIOS }}/semgrep.sarif
+          categoria: semgrep
+
+  # ===========================================================================
+  # ESTAÇÃO 3 — Build (dependências, lint e testes)
+  # Os testes incluem a regressão de cada vulnerabilidade corrigida.
+  # ===========================================================================
+  build:
+    name: "3 - Build (lint e testes)"
+    needs: sast
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Instalar dependências
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint (Ruff)
+        run: ruff check --output-format=github .
+
+      - name: Formatação (Ruff)
+        run: ruff format --check .
+
+      - name: Testes (pytest)
+        run: pytest --junitxml="$RELATORIOS/pytest.xml"
+
+      - name: Publicar resultado dos testes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relatorio-testes
+          path: ${{ env.RELATORIOS }}/pytest.xml
+          if-no-files-found: warn
+
+  # ===========================================================================
+  # ESTAÇÃO 4 — SCA e IaC (Trivy + Hadolint)
+  # CVEs das dependências e más configurações de Dockerfile e Kubernetes.
+  # Bloqueia em CRITICAL/HIGH com correção disponível (nível "error").
+  # ===========================================================================
+  sca:
+    name: "4 - SCA e IaC (Trivy)"
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Analisar dependências e infraestrutura como código
+        run: |
+          mkdir -p "$RELATORIOS"
+          trivy() { docker run --rm -v "$PWD:/src" -w /src -v "$HOME/.cache/trivy:/root/.cache/trivy" "$TRIVY_IMAGE" "$@"; }
+          trivy fs --scanners vuln --ignore-unfixed \
+            --format sarif --output "$RELATORIOS/trivy-sca.sarif" .
+          # 01-vulneravel.yaml é a baseline didática do laboratório; nunca é implantada.
+          trivy config --skip-files k8s/01-vulneravel.yaml \
+            --format sarif --output "$RELATORIOS/trivy-iac.sarif" .
+          docker run --rm --network none -v "$PWD:/src" -w /src "$HADOLINT_IMAGE" \
+            hadolint --no-fail --format sarif Dockerfile > "$RELATORIOS/hadolint.sarif"
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: "4 - SCA (dependências)"
+          relatorio: ${{ env.RELATORIOS }}/trivy-sca.sarif
+          categoria: trivy-sca
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: "4 - IaC (Dockerfile e Kubernetes)"
+          relatorio: ${{ env.RELATORIOS }}/trivy-iac.sarif
+          categoria: trivy-iac
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: "4 - Lint do Dockerfile (Hadolint)"
+          relatorio: ${{ env.RELATORIOS }}/hadolint.sarif
+          categoria: hadolint
+
+  # ===========================================================================
+  # ESTAÇÃO 5 — Package (imagem + SBOM)
+  # Constrói a imagem uma única vez e gera o SBOM (CycloneDX).
+  # ===========================================================================
+  package:
+    name: "5 - Package (imagem + SBOM)"
+    needs: sca
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Construir a imagem
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          tags: ${{ env.IMAGEM_LOCAL }}
+          outputs: type=docker,dest=${{ runner.temp }}/imagem.tar
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Gerar SBOM (CycloneDX)
+        run: |
+          docker run --rm -v "$RUNNER_TEMP:/work" "$TRIVY_IMAGE" \
+            image --input /work/imagem.tar --format cyclonedx --output /work/sbom.cdx.json
+
+      - name: Publicar imagem e SBOM para as próximas estações
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: imagem
+          path: |
+            ${{ runner.temp }}/imagem.tar
+            ${{ runner.temp }}/sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  # ===========================================================================
+  # ESTAÇÃO 6 — Scan da imagem (Trivy)
+  # SO base + pacotes instalados + segredos esquecidos nas camadas.
+  # ===========================================================================
+  scan-imagem:
+    name: "6 - Scan da Imagem (Trivy)"
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: imagem
+          path: ${{ runner.temp }}/imagem
+
+      - name: Escanear a imagem
+        run: |
+          mkdir -p "$RELATORIOS"
+          docker run --rm -v "$RUNNER_TEMP/imagem:/work:ro" -v "$PWD/$RELATORIOS:/out" "$TRIVY_IMAGE" \
+            image --input /work/imagem.tar --scanners vuln,secret --ignore-unfixed \
+              --format sarif --output /out/trivy-imagem.sarif
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: "6 - Scan da Imagem (Trivy)"
+          relatorio: ${{ env.RELATORIOS }}/trivy-imagem.sarif
+          categoria: trivy-imagem
+
+  # ===========================================================================
+  # ESTAÇÃO 7 — Homologação + DAST (OWASP ZAP)
+  # Sobe a imagem em uma rede isolada do runner e ataca a API em execução.
+  # ===========================================================================
+  homologacao-dast:
+    name: "7 - Homologação + DAST (OWASP ZAP)"
+    needs: scan-imagem
+    runs-on: ubuntu-24.04
+    environment: homologacao
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: imagem
+          path: ${{ runner.temp }}/imagem
+
+      - name: Subir a aplicação em homologação
+        run: |
+          docker load --input "$RUNNER_TEMP/imagem/imagem.tar"
+          docker network create homologacao
+          docker run --detach --name simulador --network homologacao --publish 5000:5000 \
+            --env SECRET_KEY="$(openssl rand -hex 32)" \
+            "$IMAGEM_LOCAL"
+          curl --fail --silent --show-error --retry 30 --retry-delay 2 --retry-all-errors \
+            http://localhost:5000/saude
+
+      - name: Atacar a API (scan ativo do ZAP)
+        run: |
+          mkdir -p .zap/relatorios && chmod a+rwx .zap/relatorios
+          docker run --rm --network homologacao \
+            -v "$PWD/.zap:/zap/wrk:rw" \
+            -e TARGET_URL=http://simulador:5000 \
+            "$ZAP_IMAGE" zap.sh -cmd -autorun /zap/wrk/automation.yaml
+
+      - name: Logs da aplicação
+        if: always()
+        run: docker logs simulador
+
+      - name: Publicar relatório HTML do ZAP
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relatorio-zap-html
+          path: .zap/relatorios/zap.html
+          if-no-files-found: warn
+
+      - uses: ./.github/actions/portao-seguranca
+        with:
+          nome: "7 - DAST (OWASP ZAP)"
+          relatorio: .zap/relatorios/zap.sarif.json
+          categoria: zap
+          bloquear-em: error # risco ALTO
+
+  # ===========================================================================
+  # ESTAÇÃO 8 — Aprovação humana + Deploy em produção
+  # O Environment "producao" exige um revisor: a automação vai até aqui,
+  # a decisão final é humana. Publica, assina (Sigstore) e implanta.
+  # ===========================================================================
+  producao:
+    name: "8 - Aprovação + Deploy em Produção"
+    needs: homologacao-dast
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    environment:
+      name: producao
+      url: ${{ steps.publicar.outputs.url }}
+    permissions:
+      contents: read
+      packages: write # publicar no GHCR
+      id-token: write # assinatura keyless do Cosign (OIDC)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: imagem
+          path: ${{ runner.temp }}/imagem
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publicar a imagem aprovada no GHCR
+        id: publicar
+        run: |
+          repositorio="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker load --input "$RUNNER_TEMP/imagem/imagem.tar"
+          for tag in "$GITHUB_SHA" producao; do
+            docker tag "$IMAGEM_LOCAL" "$repositorio:$tag"
+            docker push --quiet "$repositorio:$tag"
+          done
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$repositorio:$GITHUB_SHA" | cut -d@ -f2)"
+          {
+            echo "repositorio=$repositorio"
+            echo "digest=$digest"
+            echo "url=https://github.com/${GITHUB_REPOSITORY}/pkgs/container/${GITHUB_REPOSITORY#*/}"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Imagem publicada: \`$repositorio@$digest\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Assinar a imagem e anexar o SBOM (Sigstore, keyless)
+        env:
+          IMAGEM: ${{ steps.publicar.outputs.repositorio }}@${{ steps.publicar.outputs.digest }}
+        run: |
+          cosign sign --yes "$IMAGEM"
+          cosign attest --yes --type cyclonedx --predicate "$RUNNER_TEMP/imagem/sbom.cdx.json" "$IMAGEM"
+
+      - name: Deploy no Kubernetes desabilitado
+        if: vars.KUBE_DEPLOY != 'true'
+        run: >
+          echo "::notice title=Deploy::Imagem publicada e assinada. Para implantar no cluster, defina a
+          variável KUBE_DEPLOY=true e o secret KUBE_CONFIG no Environment producao."
+
+      - uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        if: vars.KUBE_DEPLOY == 'true'
+
+      - name: Implantar no Kubernetes
+        if: vars.KUBE_DEPLOY == 'true'
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+          IMAGEM_REPOSITORIO: ${{ steps.publicar.outputs.repositorio }}
+          IMAGEM_DIGEST: ${{ steps.publicar.outputs.digest }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          ADMIN_PASSWORD_HASH: ${{ secrets.ADMIN_PASSWORD_HASH }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          API_KEY_BANDEIRA: ${{ secrets.API_KEY_BANDEIRA }}
+        run: scripts/ci/deploy_k8s.sh
+
+  # ===========================================================================
+  # Resumo — visão única da execução, inclusive quando algo falha.
+  # ===========================================================================
+  resumo:
+    name: Resumo da Esteira
+    needs: [segredos, sast, build, sca, package, scan-imagem, homologacao-dast, producao]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publicar o resumo
+        env:
+          RESULTADOS: ${{ toJSON(needs) }}
+        run: |
+          {
+            echo "## Resumo da Esteira DevSecOps"
+            echo "| Estação | Resultado |"
+            echo "|---|---|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"' <<< "$RESULTADOS"
+          } >> "$GITHUB_STEP_SUMMARY"

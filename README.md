@@ -1,88 +1,133 @@
-# Simulador de Cartões de Crédito — Projeto de Exemplo
+# Simulador de Cartões de Crédito — Esteira DevSecOps
 
-Este é um projeto Flask criado **exclusivamente para fins didáticos**,
-usado como alvo de análise no laboratório de instalação e uso do
-SonarQube. O código contém vulnerabilidades **intencionais**,
-distribuídas entre os módulos, para que o SonarQube tenha o que
-encontrar durante a análise.
+API Flask de treinamento em desenvolvimento seguro. A versão original
+continha **12 vulnerabilidades plantadas** na aplicação e **9 nos manifests
+Kubernetes**; todas foram corrigidas e cada correção é protegida por um
+teste de regressão e por uma esteira DevSecOps de 8 estações.
 
-## Não faça isso em produção
+## Esteira DevSecOps (`.github/workflows/esteira-devsecops.yml`)
 
-Este projeto não deve ser:
-- Implantado em qualquer ambiente acessível pela internet;
-- Usado como referência de como escrever código seguro;
-- Executado em uma rede compartilhada com sistemas reais.
+```
+1 Segredos ─► 2 SAST ─► 3 Build ─► 4 SCA/IaC ─► 5 Package ─► 6 Scan imagem ─► 7 Homolog + DAST ─► 8 Aprovação + Produção
+```
 
-Ele deve rodar apenas dentro da VM isolada do laboratório.
+| # | Estação | Ferramenta | Bloqueia quando |
+|---|---------|------------|-----------------|
+| 1 | Segredos | Gitleaks (histórico completo) | qualquer segredo novo |
+| 2 | SAST | Semgrep: OWASP Top 10, Python, Flask, secrets + `regras-banco/` | achado de severidade ERROR |
+| 3 | Build | Ruff (lint e formatação) + pytest | lint ou teste falhando |
+| 4 | SCA e IaC | Trivy (dependências, Dockerfile, k8s) + Hadolint | CVE CRITICAL/HIGH com correção; má configuração HIGH+ |
+| 5 | Package | Docker Buildx + SBOM CycloneDX | falha de build |
+| 6 | Scan da imagem | Trivy (SO, pacotes, segredos nas camadas) | CVE CRITICAL/HIGH com correção |
+| 7 | Homologação + DAST | OWASP ZAP, scan **ativo** sobre todas as rotas | alerta de risco ALTO |
+| 8 | Aprovação + Produção | Environment `producao`, GHCR, Cosign, kubectl | revisor rejeita, assinatura inválida ou rollout falha |
+
+Princípios do desenho:
+
+- **Uma imagem, um caminho.** A imagem é construída uma vez (estação 5) e o
+  mesmo artefato passa pelas estações 6, 7 e 8. Nada vai para o registry
+  antes da aprovação humana, e o deploy usa o **digest**, não uma tag.
+- **Um portão para todos.** Todo scanner gera SARIF, e uma única política
+  (`scripts/ci/security_gate.py`, com testes) decide se o build passa,
+  publica o resumo no job e anota os achados no código. O portão **falha
+  fechado**: se o relatório estiver ausente ou inválido, o build é bloqueado.
+- **Cadeia de suprimentos.** As actions são fixadas por SHA de commit e as
+  ferramentas por versão + digest. As permissões do `GITHUB_TOKEN` são
+  mínimas e definidas por job. A imagem é assinada sem chave (Sigstore) e
+  leva o SBOM atestado. O Dependabot mantém tudo atualizado.
+- **Vigilância contínua.** `scan-agendado.yml` repete diariamente as
+  varreduras de segredos, dependências e da imagem em produção.
+
+### Configuração no GitHub
+
+| Item | Onde | Uso |
+|------|------|-----|
+| Environment `producao` com *Required reviewers* | Settings → Environments | aprovação humana da estação 8 |
+| Environment `homologacao` | Settings → Environments | estação 7 |
+| Variável `KUBE_DEPLOY=true` | Environment `producao` | habilita o deploy no cluster (sem ela, a estação 8 publica e assina a imagem) |
+| Secrets `KUBE_CONFIG` (kubeconfig em base64), `SECRET_KEY`, `ADMIN_PASSWORD_HASH`, `DB_PASSWORD`, `API_KEY_BANDEIRA` | Environment `producao` | deploy e Secret do Kubernetes |
+
+O cluster precisa conseguir baixar a imagem do GHCR: torne o pacote público
+ou configure um `imagePullSecret`.
+
+## Executando localmente
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+ruff check . && ruff format --check . && pytest
+
+export SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+export ADMIN_PASSWORD_HASH="$(python scripts/gerar_hash_senha.py)"
+python app.py                      # desenvolvimento (127.0.0.1:5000)
+
+docker build -t simulador-cartoes . # produção: Gunicorn, usuário 10001
+docker run --rm -p 5000:5000 -e SECRET_KEY="$SECRET_KEY" simulador-cartoes
+```
+
+Variáveis de ambiente opcionais: `FLASK_DEBUG`, `DB_PATH`, `EXTRATOS_DIR`,
+`GERADOR_RELATORIO` e `WEBHOOK_HOSTS_PERMITIDOS` (hosts separados por vírgula).
+
+## Vulnerabilidades da aplicação: o que foi corrigido
+
+| # | Arquivo | Vulnerabilidade original | Correção |
+|---|---------|---------------------------|----------|
+| 1 | `config.py` | Segredos hardcoded | tudo vem do ambiente; `SECRET_KEY` é obrigatória (falha na subida) |
+| 2 | `app.py` | `debug=True` | debug desligado por padrão; em contêiner roda no Gunicorn |
+| 3 | `modulos/autenticacao.py` | Hash MD5 | scrypt com salt (Werkzeug); verificação em tempo constante |
+| 4 | `modulos/autenticacao.py` | Token com `random` | `secrets.token_urlsafe(32)` |
+| 5–6 | `modulos/cartoes.py` | SQL Injection | consultas parametrizadas, validação estrita, número do cartão mascarado |
+| 7 | `modulos/relatorios.py` | Command Injection no relatório | allowlist de formatos, sem shell, executável fixo, timeout |
+| 8 | `modulos/relatorios.py` | Path Traversal | `safe_join` restrito ao diretório de extratos |
+| 9 | `modulos/relatorios.py` | Execução de comando arbitrário | só verificações internas pré-definidas |
+| 10 | `modulos/notificacoes.py` | SSRF | só HTTPS, porta 443, allowlist de hosts, sem redirects |
+| 11 | `modulos/notificacoes.py` | `pickle.loads` | JSON com validação de tipo e tamanho |
+| 12 | `modulos/credito.py` | `eval()` | avaliador aritmético restrito sobre a AST |
+
+Controles transversais: cabeçalhos de segurança (CSP, `nosniff`, `X-Frame-Options`...)
+em toda resposta e erros em JSON padronizado, sem stack trace para o cliente.
+Os testes ficam em `tests/test_correcoes_vulnerabilidades.py`, um bloco por item.
+
+## Kubernetes
+
+| # | Vulnerabilidade em `k8s/01-vulneravel.yaml` | Corrigida em |
+|---|----------------------------------------------|--------------|
+| 1 | ClusterRoleBinding de cluster-admin | `02-rbac-corrigido.yaml` |
+| 2 | Segredo em ConfigMap | Secret criado pela esteira a partir dos GitHub Secrets |
+| 3–5 | privileged, root, privilege escalation | `07-deployment-hardened.yaml` |
+| 6 | Tag `latest` | `07` (imagem por digest, injetado pela esteira) |
+| 7–8 | Sem resources e sem probes | `07-deployment-hardened.yaml` |
+| 9 | Sem NetworkPolicy | `03`, `04` e `05-networkpolicy-*.yaml` |
+
+`08-namespace-pod-security.yaml` aplica Pod Security **restricted**, então o
+próprio API Server rejeita pods inseguros. Para conferir, aplique a baseline
+`01` num cluster de laboratório e veja a rejeição.
+
+> `k8s/01-vulneravel.yaml` continua no repositório **apenas como material
+> didático** (o "antes"). A esteira nunca o implanta, e ele fica fora das
+> varreduras de SAST e IaC de forma explícita (`.semgrepignore` e `--skip-files`).
+> Se o laboratório já criou o ClusterRoleBinding vulnerável, remova-o:
+> `kubectl delete clusterrolebinding simulador-cartoes-binding`.
+
+## Segredos no histórico
+
+Versões antigas deste repositório tinham segredos fictícios commitados
+(`config.py`, manifests e um `leaks.json`). Eles saíram do código e estão
+registrados no baseline `.gitleaksignore`, então a estação 1 continua
+varrendo **todo** o histórico e bloqueia qualquer segredo novo. Em um cenário
+real, esses valores seriam considerados comprometidos e **rotacionados**.
 
 ## Estrutura
 
 ```
-projeto-exemplo/
-├── app.py                      # Aplicação Flask principal (rotas + /saude)
-├── config.py                   # Configurações — contém segredos hardcoded
-├── Dockerfile                  # Containeriza a aplicação (laboratório Kubernetes)
-├── .dockerignore
-├── modulos/
-│   ├── autenticacao.py         # Hash MD5 e token de sessão previsível
-│   ├── cartoes.py              # SQL Injection
-│   ├── relatorios.py           # Command Injection e Path Traversal
-│   └── notificacoes.py         # SSRF, deserialização insegura, eval()
-├── regras-banco/                # Regras customizadas do Semgrep (laboratório Semgrep)
-│   ├── hash-fraco.yaml
-│   ├── eval-perigoso.yaml
-│   ├── sql-injection-taint.yaml
-│   ├── command-injection.yaml
-│   └── deserializacao-insegura.yaml
-├── k8s/                          # Manifests do laboratório de Kubernetes (Minikube)
-│   ├── 00-namespace.yaml
-│   ├── 01-vulneravel.yaml               # Baseline com 9 vulnerabilidades plantadas
-│   ├── 02-rbac-corrigido.yaml
-│   ├── 03-networkpolicy-default-deny.yaml
-│   ├── 04-networkpolicy-allow-dns.yaml
-│   ├── 05-networkpolicy-allow-gateway.yaml
-│   ├── 06-secret-corrigido.yaml
-│   ├── 07-deployment-hardened.yaml
-│   └── 08-namespace-pod-security.yaml
-├── requirements.txt
-└── sonar-project.properties    # Configuração de análise do SonarQube
+├── app.py, config.py           # API Flask e configuração por ambiente
+├── modulos/                    # regras de negócio (sem dependência do Flask)
+├── tests/                      # contrato HTTP, regressões de segurança, portão
+├── scripts/
+│   ├── gerar_hash_senha.py     # gera ADMIN_PASSWORD_HASH
+│   └── ci/                     # portão SARIF e deploy no Kubernetes
+├── regras-banco/               # regras customizadas do Semgrep
+├── k8s/                        # baseline didática (01) e manifests corrigidos
+├── .zap/automation.yaml        # plano do DAST (OWASP ZAP)
+└── .github/                    # esteira, scan agendado, Dependabot, action do portão
 ```
-
-## Vulnerabilidades plantadas (gabarito rápido)
-
-| # | Arquivo | Vulnerabilidade |
-|---|---------|------------------|
-| 1 | config.py | Segredos hardcoded (SECRET_KEY, DB_PASSWORD, API_KEY_BANDEIRA) |
-| 2 | app.py | `debug=True` em execução |
-| 3 | modulos/autenticacao.py | Hash de senha com MD5 (algoritmo fraco) |
-| 4 | modulos/autenticacao.py | Geração de token com `random` em vez de `secrets` |
-| 5 | modulos/cartoes.py | SQL Injection em `consultar_fatura` |
-| 6 | modulos/cartoes.py | SQL Injection em `buscar_cartoes_cliente` |
-| 7 | modulos/relatorios.py | Command Injection em `gerar_relatorio_pdf` |
-| 8 | modulos/relatorios.py | Path Traversal em `baixar_extrato` |
-| 9 | modulos/relatorios.py | Command Injection em `executar_diagnostico` |
-| 10 | modulos/notificacoes.py | SSRF em `enviar_webhook` |
-| 11 | modulos/notificacoes.py | Deserialização insegura (`pickle.loads`) |
-| 12 | modulos/notificacoes.py | Uso perigoso de `eval()` |
-
-Consulte o laboratório completo para o passo a passo de instalação do
-SonarQube, execução da análise e interpretação de cada um destes
-achados na interface web.
-
-## Vulnerabilidades plantadas nos manifests Kubernetes (k8s/01-vulneravel.yaml)
-
-| # | Vulnerabilidade | Corrigida em |
-|---|------------------|--------------|
-| 1 | ClusterRoleBinding concedendo cluster-admin | 02-rbac-corrigido.yaml |
-| 2 | Segredo em ConfigMap (texto claro), não em Secret | 06-secret-corrigido.yaml |
-| 3 | `securityContext.privileged: true` | 07-deployment-hardened.yaml |
-| 4 | `securityContext.runAsUser: 0` (root explícito) | 07-deployment-hardened.yaml |
-| 5 | `securityContext.allowPrivilegeEscalation: true` | 07-deployment-hardened.yaml |
-| 6 | Tag de imagem `latest` | 07-deployment-hardened.yaml |
-| 7 | Ausência de `resources` (requests/limits) | 07-deployment-hardened.yaml |
-| 8 | Ausência de liveness/readiness probes | 07-deployment-hardened.yaml |
-| 9 | Nenhuma NetworkPolicy restringindo tráfego | 03, 04 e 05-networkpolicy-*.yaml |
-
-Consulte o Laboratório de Segurança em Kubernetes para o passo a passo
-completo de instalação do Minikube, deploy da baseline vulnerável, e
-aplicação progressiva de cada correção.

@@ -1,0 +1,5 @@
+# Testes exercitam payloads de ataque de propósito.
+tests/
+# Baseline INTENCIONALMENTE vulnerável do laboratório de Kubernetes.
+# Nunca é implantada pela esteira (ver README, seção Kubernetes).
+k8s/01-vulneravel.yaml
